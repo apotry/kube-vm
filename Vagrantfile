@@ -1,7 +1,7 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 
-servers = [
+nodes = [
     {
         :name => "k8s-master",
         :type => "master",
@@ -42,6 +42,7 @@ servers = [
 
 $configureCommon = <<-SCRIPT
     CONTAINERD_VERSION=1.2.4
+    KUBERNETES_VERSION=1.15.3
 
     yum update
     yum install -y wget
@@ -67,6 +68,10 @@ net.bridge.bridge-nf-call-iptables = 1
 net.ipv4.ip_forward = 1
 EOF
 
+    cat > /etc/sysctl.d/98-es-max-map-count.conf <<EOF
+vm.max_map_count=1048576
+EOF
+
     sysctl --system
 
     wget https://storage.googleapis.com/cri-containerd-release/cri-containerd-${CONTAINERD_VERSION}.linux-amd64.tar.gz
@@ -88,28 +93,13 @@ gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cl
 exclude=kube*
 EOF
 
-    yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+    yum install -y kubelet-$KUBERNETES_VERSION kubeadm-$KUBERNETES_VERSION kubectl-$KUBERNETES_VERSION --disableexcludes=kubernetes
 
 
     # ip of this box
     IP_ADDR=`ip address show eth1 | grep inet | head -n 1 | awk '{print $2}' | cut -f1 -d/`
 
-    ARGS="--allow-privileged=true \
---fail-swap-on=false \
---enable-controller-attach-detach=false \
---container-log-max-size=100Mi \
---container-log-max-files=3 \
---node-ip=$IP_ADDR \
---kube-reserved-cgroup=/podruntime \
---system-reserved-cgroup=/system.slice \
---kubelet-cgroups=/podruntime/kubelet \
---runtime-cgroups=/podruntime/runtime \
---runtime-request-timeout=15m \
---container-runtime=remote \
---container-runtime-endpoint=unix:///run/containerd/containerd.sock \
---feature-gates=ExperimentalCriticalPodAnnotation=true \
---feature-gates=CRIContainerLogRotation=true \
---file-check-frequency=5s"
+    ARGS="--node-ip=$IP_ADDR --config=/home/vagrant/kubelet-conf.json"
 
     sed -i "s|KUBELET_EXTRA_ARGS=.*|KUBELET_EXTRA_ARGS=$ARGS|g" /etc/sysconfig/kubelet
 
@@ -126,12 +116,13 @@ $configureMaster = <<-SCRIPT
 
     # install k8s master
     HOST_NAME=$(hostname -s)
-    kubeadm init --apiserver-advertise-address=$IP_ADDR --apiserver-cert-extra-sans=$IP_ADDR --node-name $HOST_NAME --pod-network-cidr=172.16.0.0/16 --cri-socket=unix:///run/containerd/containerd.sock -v 10
+    kubeadm init --config=/home/vagrant/kubeadm-conf.yaml --node-name $HOST_NAME  --cri-socket=unix:///run/containerd/containerd.sock -v 10
 
     #copying credentials to regular user - vagrant
     sudo --user=vagrant mkdir -p /home/vagrant/.kube
-    cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
-    chown $(id -u vagrant):$(id -g vagrant) /home/vagrant/.kube/config
+
+    cp -f /etc/kubernetes/admin.conf /home/vagrant/.kube/admin.conf
+    chown $(id -u vagrant):$(id -g vagrant) /home/vagrant/.kube/admin.conf
 
     export KUBECONFIG=/etc/kubernetes/admin.conf
 
@@ -148,6 +139,24 @@ $configureMaster = <<-SCRIPT
     kubectl apply -f /home/vagrant/calico-rbac.yaml
     kubectl apply -f /home/vagrant/calico.yaml
 
+    # create Calico API Config file
+    ## 1. copy the cert files
+    cp /etc/kubernetes/pki/etcd/server.key /home/vagrant/.kube/etcd-key.pem
+    cp /etc/kubernetes/pki/etcd/server.crt /home/vagrant/.kube/etcd-cert.pem
+    cp /etc/kubernetes/pki/etcd/ca.crt /home/vagrant/.kube/etcd-ca.pem
+
+    ## 2. create the CalicoAPIConfig yaml file
+    cat > /home/vagrant/.kube/calico-api-config.yaml <<EOF
+apiVersion: projectcalico.org/v3
+kind: CalicoAPIConfig
+spec:
+  datastoreType: etcdv3
+  etcdEndpoints: https://$IP_ADDR:2379
+  etcdKeyFile: $1/.kube/etcd-key.pem
+  etcdCertFile: $1/.kube/etcd-cert.pem
+  etcdCACertFile: $1/.kube/etcd-ca.pem
+EOF
+
     kubeadm token create --print-join-command >> /etc/kubeadm_join_cmd.sh
     chmod +x /etc/kubeadm_join_cmd.sh
 
@@ -163,15 +172,29 @@ $configureNode = <<-SCRIPT
     swapon /swapfile
 SCRIPT
 
-Vagrant.configure("2") do |config|
+$removeMasterTaint = <<-SCRIPT
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    if [ "$1" == "master-only: true" ]; then
+        kubectl taint node k8s-master node-role.kubernetes.io/master-
+    fi
+SCRIPT
 
-    servers.each do |opts|
+$installMetricsServer = <<-SCRIPT
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    if [ "$1" == "install: true" ]; then
+        kubectl create -f /vagrant/metrics-server/deploy/1.8+/
+        kubectl patch deploy metrics-server -n kube-system --patch "$(cat /vagrant/patch-metrics-server.yaml)"
+    fi
+SCRIPT
+
+Vagrant.configure("2") do |config|
+    nodes.each do |opts|
         config.vm.define opts[:name] do |config|
 
             config.vm.box = opts[:box]
             config.vm.box_version = opts[:box_version]
             config.vm.hostname = opts[:name]
-            config.vm.network :private_network, ip: opts[:eth1] #, virtualbox__intnet: true
+            config.vm.network :private_network, ip: opts[:eth1]
 
             config.vm.provider "virtualbox" do |v|
                 v.name = opts[:name]
@@ -179,28 +202,33 @@ Vagrant.configure("2") do |config|
                 v.customize ["modifyvm", :id, "--memory", opts[:mem]]
                 v.customize ["modifyvm", :id, "--cpus", opts[:cpu]]
                 v.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
-            end
+                v.customize ["modifyvm", :id, "--natdnsproxy1", "on"]
+                v.customize ["modifyvm", :id, "--nictype1", "virtio"]
+                v.customize ["modifyvm", :id, "--nictype2", "virtio"]
 
-            config.vm.synced_folder ".kube", "/home/vagrant/.kube"
+            end
 
             config.vm.provision "file", source: "./calico.yaml", destination: "calico.yaml"
             config.vm.provision "file", source: "./calico-rbac.yaml", destination: "calico-rbac.yaml"
             config.vm.provision "file", source: "./config.toml", destination: "config.toml"
+            config.vm.provision "file", source: "./kubelet-conf.json", destination: "kubelet-conf.json"
+            config.vm.provision "file", source: "./kubeadm-conf.yaml", destination: "kubeadm-conf.yaml"
+            config.vm.provision "file", source: "./audit-policy.yaml", destination: "audit-policy.yaml"
+            config.vm.synced_folder ".", "/vagrant", type: "rsync", rsync__args: ["--verbose", "--archive", "--delete", "-z"]
+
+            config.vm.synced_folder "./oci", "/oci"
 
             config.vm.provision "shell", inline: $configureCommon
 
             if opts[:type] == "master"
-                config.vm.provision "shell", inline: $configureMaster
+                config.vm.synced_folder ".kube/", "/home/vagrant/.kube/"
+                config.vm.provision "shell", inline: $configureMaster, args: [File.dirname(__FILE__)]
             else
                 config.vm.provision "shell", inline: $configureNode
-                # for i in 30000..32767
-                #     config.vm.network :forwarded_port, guest: i, host: i
-                # end
             end
+
+            config.vm.provision "shell", inline: $removeMasterTaint, args: ["master-only: #{nodes.count == 1}"]
+            config.vm.provision "shell", inline: $installMetricsServer, args: ["install: #{nodes.count == 1 || opts[:type] == 'node'}"]
         end
-    end
-
-    servers.each do |opts|
-
     end
 end

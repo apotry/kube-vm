@@ -1,4 +1,7 @@
-# Installation
+# Installation 
+
+Kubernetes: 1.15.3
+Containerd: 1.2.4
 
 Follow these instructions to locally set up a 3 node kubernetes cluster with 1
 dedicated master containing a single Etcd. All nodes will be running calico and containerd.
